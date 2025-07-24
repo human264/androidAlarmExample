@@ -20,39 +20,38 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import java.io.*
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import java.util.*
 
-/** SPP(Foreground) 서버 – TXT·IMG 프로토콜 대응 */
+/** SPP 서버(Foreground Service) */
 class SppServerService : Service() {
 
     /* ───────── 상수 ───────── */
     companion object {
         private const val TAG             = "SppServer"
-        private const val CH_STATUS       = "spp_status"
-        private const val CH_MESSAGE      = "spp_msg"
-        const val EXTRA_MSG = "msg"
-        private const val NOTI_FGS   = 1     // 서비스
-        private const val NOTI_STATE = 100   // 연결/해제
-        private var   notiSeq = 2            // 일반 메시지
+        private const val CHANNEL_STATUS  = "spp_status"
+        private const val CHANNEL_MESSAGE = "spp_msg"
 
-        /** 표준 SPP UUID */
+        private const val NOTI_FGS   = 1          // 서비스 상태
+        private const val NOTI_STATE = 100        // 연결/해제 상태
+        private var       notiSeq    = 2          // 일반 메시지
+
+        /** 표준 SPP UUID */
         val SPP_UUID: UUID =
             UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-        /** 3‑바이트 헤더 */
-        private val H_TXT = byteArrayOf(0x54, 0x58, 0x54)   // "TXT"
-        private val H_IMG = byteArrayOf(0x49, 0x4D, 0x47)   // "IMG"
+        /** 사용자 정의 헤더 */
+        private val MAGIC_TXT = byteArrayOf(0x54, 0x58, 0x54) // "TXT"
+        private val MAGIC_IMG = byteArrayOf(0x49, 0x4D, 0x47) // "IMG"
 
-        /* ─── 내부 브로드캐스트 ─── */
-        const val ACTION_STATUS  = "com.example.myapplication.ACTION_SPP_STATUS"
-        const val ACTION_MSG     = "com.example.myapplication.ACTION_SPP_MSG"   // ★ 복구
-        const val EXTRA_TITLE    = "title"   // 메시지 제목
-        const val EXTRA_BODY     = "body"    // 메시지 본문
-        const val EXTRA_STATUS   = "status"
+        /* 내부 브로드캐스트(옵션) */
+        const val ACTION_MSG    = "com.example.myapplication.ACTION_SPP_MSG"
+        const val EXTRA_MSG     = "msg"
+        const val ACTION_STATUS = "com.example.myapplication.ACTION_SPP_STATUS"
+        const val EXTRA_STATUS  = "status"
     }
 
-
-    /* 숨은 listenUsingInsecureRfcommOn(int) –(Android S 미만) */
+    /* 숨은 API 캐싱(S 미만) */
     private val hiddenInsecureOn by lazy {
         runCatching {
             BluetoothAdapter::class.java.getMethod(
@@ -64,12 +63,12 @@ class SppServerService : Service() {
     private var insecureSocket: BluetoothServerSocket? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    /*──────────────── Service lifecycle ────────────────*/
+    /*──────────────── Service 수명 ────────────────*/
     @RequiresApi(Build.VERSION_CODES.O)
     override fun onCreate() {
         super.onCreate()
         createChannels()
-        startForeground(NOTI_FGS, fgsNoti("SPP 서버 초기화…"))
+        startForeground(NOTI_FGS, buildFgsNoti("SPP 서버 초기화…"))
         launchServer()
     }
 
@@ -84,21 +83,15 @@ class SppServerService : Service() {
     @SuppressLint("MissingPermission")
     private fun launchServer() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
-            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.checkSelfPermission(
+                this, Manifest.permission.BLUETOOTH_CONNECT
+            ) != PackageManager.PERMISSION_GRANTED) {
             emitStatus("BLUETOOTH_CONNECT 권한 없음", true); stopSelf(); return
         }
-
         val adapter = BluetoothAdapter.getDefaultAdapter()
         if (!adapter.isEnabled) { emitStatus("Bluetooth OFF", true); stopSelf(); return }
 
-        /* insecure / secure 두 소켓 모두 연다 */
-        insecureSocket = adapter.listenUsingInsecureRfcommWithServiceRecord(
-            "SPP‑Insecure", SPP_UUID).also { emitStatus("listen insecure(UUID) ✔") }
-
-        secureSocket = adapter.listenUsingRfcommWithServiceRecord(
-            "SPP‑Secure", SPP_UUID).also { emitStatus("listen secure(UUID) ✔") }
-
+        openSockets(adapter)
         emitStatus("SPP(UUID) secure+insecure 대기 중…")
 
         listOfNotNull(secureSocket, insecureSocket).forEach { ss ->
@@ -113,21 +106,61 @@ class SppServerService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private fun openSockets(adapter: BluetoothAdapter) {
+        insecureSocket = adapter.listenUsingInsecureRfcommWithServiceRecord(
+            "SPP‑Server‑INSECURE", SPP_UUID).also { emitStatus("listen insecure(UUID) ✔") }
+
+        secureSocket = adapter.listenUsingRfcommWithServiceRecord(
+            "SPP‑Server‑SECURE", SPP_UUID).also { emitStatus("listen secure(UUID) ✔") }
+    }
+
     /*──────────────── 클라이언트 처리 ────────────────*/
     private fun handleClient(sock: BluetoothSocket) = scope.launch {
-        val peer = sock.remoteDevice.address
-        showStateNoti("🔵 SPP 연결됨", "PC $peer 과 연결되었습니다")
+        showStateNoti("🔵 SPP 연결됨",
+            "PC ${sock.remoteDevice.address} 과 연결되었습니다")
         toast("SPP 연결 완료")
-        emitStatus("클라이언트 접속: $peer")
+        emitStatus("클라이언트 접속: ${sock.remoteDevice.address}")
 
         try {
             sock.use {
                 val ins = it.inputStream
                 while (true) {
-                    val hdr = readExactOrNull(ins, 3) ?: break   // EOF → 종료
+                    val magic = readExactOrNull(ins, 3) ?: break        // EOF → while‑exit
                     when {
-                        hdr.contentEquals(H_IMG) -> readImagePacket(ins)
-                        hdr.contentEquals(H_TXT) -> readTextPacket(ins)
+                        /* ─── IMG 프로토콜 (이전과 동일) ─── */
+                        magic.contentEquals(MAGIC_IMG) -> {
+                            val len = ByteBuffer.wrap(readExact(ins, 4)).int
+                            if (len !in 1..1_000_000) { emitStatus("이미지 len=$len 오류", true); break }
+                            val imgData = readExact(ins, len)
+                            ins.read()                                   // '\n'
+                            val title = readLineUtf8(ins)
+                            val body  = readLineUtf8(ins)
+                            val bmp   = BitmapFactory.decodeByteArray(imgData, 0, len)
+                            if (bmp != null) showImageTextNoti(bmp, title, body)
+                            else emitStatus("Bitmap 디코딩 실패", true)
+                        }
+
+                        /* ─── TXT 프로토콜 ─── */
+                        magic.contentEquals(MAGIC_TXT) -> {
+                            val version = ins.read()
+                            if (version == 1) {
+                                /* 새 v1 포맷: [TXT][01][tLen][title…][bLen][body…] */
+                                val tLen = DataInputStream(ins).readInt()
+                                val titleBytes = readExact(ins, tLen)
+                                val bLen = DataInputStream(ins).readInt()
+                                val bodyBytes  = readExact(ins, bLen)
+                                val title = String(titleBytes, StandardCharsets.UTF_8)
+                                val body  = String(bodyBytes , StandardCharsets.UTF_8)
+                                showTextNoti(title, body)
+                            } else {
+                                /* 구버전(헤더 뒤 LF 기준 두 줄) 대비 호환 */
+                                val title = readLineUtf8(ins)
+                                val body  = readLineUtf8(ins)
+                                showTextNoti(title, body)
+                            }
+                        }
+
                         else -> emitStatus("알 수 없는 헤더", true)
                     }
                 }
@@ -139,45 +172,13 @@ class SppServerService : Service() {
             toast("SPP 연결 종료")
         }
     }
-    /*────────── Packet 파서 ──────────*/
-    private fun readTextPacket(ins: InputStream) {
-        val title = readLineUtf8(ins).ifEmpty { "(제목 없음)" }
-        val body  = readLineUtf8(ins)
-        showTextNoti(title, body)
-        /* ▶ Broadcast */
-        sendBroadcast(
-            Intent(ACTION_MSG)
-                .putExtra(EXTRA_TITLE, title)
-                .putExtra(EXTRA_BODY,  body)
-                .putExtra(EXTRA_MSG,   body)      // ★ 추가
-        )
-    }
-
-
-    private fun readImagePacket(ins: InputStream) {
-        val len = ByteBuffer.wrap(readExact(ins, 4)).int
-        if (len !in 1..1_000_000) { emitStatus("이미지 len=$len 오류", true); return }
-        val imageBytes = readExact(ins, len)
-        ins.read()                     // '\n'
-        val title = readLineUtf8(ins).ifEmpty { "(제목 없음)" }
-        val body  = readLineUtf8(ins)
-
-        BitmapFactory.decodeByteArray(imageBytes, 0, len)?.let { bmp ->
-            showImageTextNoti(bmp, title, body)
-            /* ▶ Broadcast (썸네일은 보내지 않고, 제목/본문만) */
-            sendBroadcast(
-                Intent(ACTION_MSG).putExtra(EXTRA_TITLE, title).putExtra(EXTRA_BODY, body)
-            )
-        } ?: emitStatus("Bitmap 디코딩 실패", true)
-    }
-
 
     /*─────────── I/O 헬퍼 ───────────*/
     private fun readExact(ins: InputStream, size: Int): ByteArray =
-        ByteArray(size).also { buf ->
+        ByteArray(size).also { b ->
             var off = 0
             while (off < size) {
-                val r = ins.read(buf, off, size - off)
+                val r = ins.read(b, off, size - off)
                 if (r < 0) throw EOFException()
                 off += r
             }
@@ -190,15 +191,15 @@ class SppServerService : Service() {
         BufferedReader(InputStreamReader(ins, Charsets.UTF_8)).readLine() ?: ""
 
     /*─────────── 알림 & 로그 ───────────*/
-    private fun emitStatus(msg: String, err: Boolean = false) {
-        val text = if (err) "[ERR] $msg" else msg
-        if (err) Log.w(TAG, text) else Log.i(TAG, text)
-        sendBroadcast(Intent(ACTION_STATUS).putExtra(EXTRA_STATUS, text))
-        nm().notify(NOTI_FGS, fgsNoti(text))
+    private fun emitStatus(text: String, err: Boolean = false) {
+        val t = if (err) "[ERR] $text" else text
+        if (err) Log.w(TAG, t) else Log.i(TAG, t)
+        sendBroadcast(Intent(ACTION_STATUS).putExtra(EXTRA_STATUS, t))
+        nm().notify(NOTI_FGS, buildFgsNoti(t))
     }
 
-    private fun fgsNoti(text: String) =
-        NotificationCompat.Builder(this, CH_STATUS)
+    private fun buildFgsNoti(text: String) =
+        NotificationCompat.Builder(this, CHANNEL_STATUS)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("SPP Server")
             .setContentText(text)
@@ -209,7 +210,7 @@ class SppServerService : Service() {
     private fun showTextNoti(title: String, body: String) =
         nm().notify(
             notiSeq++,
-            NotificationCompat.Builder(this, CH_MESSAGE)
+            NotificationCompat.Builder(this, CHANNEL_MESSAGE)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle(title)
                 .setContentText(body)
@@ -227,7 +228,7 @@ class SppServerService : Service() {
         }
         nm().notify(
             notiSeq++,
-            NotificationCompat.Builder(this, CH_MESSAGE)
+            NotificationCompat.Builder(this, CHANNEL_MESSAGE)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle(title)
                 .setStyle(NotificationCompat.DecoratedCustomViewStyle())
@@ -244,7 +245,7 @@ class SppServerService : Service() {
     private fun showStateNoti(title: String, body: String) =
         nm().notify(
             NOTI_STATE,
-            NotificationCompat.Builder(this, CH_STATUS)
+            NotificationCompat.Builder(this, CHANNEL_STATUS)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                 .setContentTitle(title)
                 .setContentText(body)
@@ -259,24 +260,27 @@ class SppServerService : Service() {
     @RequiresApi(Build.VERSION_CODES.O)
     private fun createChannels() {
         nm().createNotificationChannel(
-            NotificationChannel(CH_STATUS, "SPP 서버 상태",
-                NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+            NotificationChannel(
+                CHANNEL_STATUS, "SPP 서버 상태",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply { setShowBadge(false) })
 
         nm().createNotificationChannel(
-            NotificationChannel(CH_MESSAGE, "SPP 메시지",
-                NotificationManager.IMPORTANCE_HIGH).apply {
+            NotificationChannel(
+                CHANNEL_MESSAGE, "SPP 메시지",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 200, 150, 200)
             })
     }
 
-    /*────────── 헬퍼 ──────────*/
+    /*────────── 확장 & 헬퍼 ──────────*/
     private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     private fun toast(msg: String) =
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
         }
-
     private fun BluetoothServerSocket.socketType() =
         if (this === secureSocket) "secure" else "insecure"
 }
