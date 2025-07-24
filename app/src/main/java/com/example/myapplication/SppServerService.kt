@@ -133,13 +133,16 @@ class SppServerService : Service() {
                             val len = ByteBuffer.wrap(readExact(ins, 4)).int
                             if (len !in 1..1_000_000) { emitStatus("이미지 len=$len 오류", true); break }
                             val imgData = readExact(ins, len)
-                            ins.read()                                   // '\n'
+
+                            /* 🔄 변경 : readLineUtf8 가 LF 까지 처리하므로 ins.read() 삭제 */
                             val title = readLineUtf8(ins)
                             val body  = readLineUtf8(ins)
+
                             val bmp   = BitmapFactory.decodeByteArray(imgData, 0, len)
                             if (bmp != null) showImageTextNoti(bmp, title, body)
                             else emitStatus("Bitmap 디코딩 실패", true)
                         }
+
 
                         /* ─── TXT 프로토콜 ─── */
                         magic.contentEquals(MAGIC_TXT) -> {
@@ -187,9 +190,15 @@ class SppServerService : Service() {
     private fun readExactOrNull(ins: InputStream, size: Int): ByteArray? =
         try { readExact(ins, size) } catch (_: EOFException) { null }
 
-    private fun readLineUtf8(ins: InputStream): String =
-        BufferedReader(InputStreamReader(ins, Charsets.UTF_8)).readLine() ?: ""
-
+    private fun readLineUtf8(ins: InputStream): String {
+        val buf = ByteArrayOutputStream()
+        while (true) {
+            val b = ins.read()
+            if (b == -1 || b == '\n'.code) break      // EOF 또는 LF → 종료
+            buf.write(b)
+        }
+        return buf.toString(Charsets.UTF_8.name())
+    }
     /*─────────── 알림 & 로그 ───────────*/
     private fun emitStatus(text: String, err: Boolean = false) {
         val t = if (err) "[ERR] $text" else text
