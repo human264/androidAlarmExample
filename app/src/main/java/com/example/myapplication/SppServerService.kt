@@ -130,17 +130,31 @@ class SppServerService : Service() {
                     when {
                         /* ─── IMG 프로토콜 (이전과 동일) ─── */
                         magic.contentEquals(MAGIC_IMG) -> {
-                            val len = ByteBuffer.wrap(readExact(ins, 4)).int
-                            if (len !in 1..1_000_000) { emitStatus("이미지 len=$len 오류", true); break }
-                            val imgData = readExact(ins, len)
+                            try {
+                                val dis = DataInputStream(ins)
 
-                            /* 🔄 변경 : readLineUtf8 가 LF 까지 처리하므로 ins.read() 삭제 */
-                            val title = readLineUtf8(ins)
-                            val body  = readLineUtf8(ins)
+                                val imgLen   = dis.readInt()
+                                if (imgLen !in 1..1_000_000) {
+                                    emitStatus("이미지 len=$imgLen 오류", true); break
+                                }
+                                val imgData  = readExact(ins, imgLen)
 
-                            val bmp   = BitmapFactory.decodeByteArray(imgData, 0, len)
-                            if (bmp != null) showImageTextNoti(bmp, title, body)
-                            else emitStatus("Bitmap 디코딩 실패", true)
+                                val titleLen = dis.readInt()
+                                val title    = String(readExact(ins, titleLen), StandardCharsets.UTF_8)
+
+                                val bodyLen  = dis.readInt()
+                                val body     = String(readExact(ins, bodyLen), StandardCharsets.UTF_8)
+
+                                /* 비트맵 디코딩 및 알림 */
+                                BitmapFactory.decodeByteArray(imgData, 0, imgLen)?.let { bmp ->
+                                    showImageTextNoti(bmp, title, body)
+                                    // 필요하다면 내부 브로드캐스트
+                                    sendBroadcast(Intent(ACTION_MSG).putExtra(EXTRA_MSG, "🖼️ $title: $body"))
+                                } ?: emitStatus("Bitmap 디코딩 실패", true)
+
+                            } catch (e: Exception) {
+                                emitStatus("이미지 처리 예외: ${e.message}", true)
+                            }
                         }
 
 
