@@ -1,9 +1,12 @@
 package com.example.myapplication
 
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
+import androidx.core.content.ContextCompat.registerReceiver
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
@@ -14,4 +17,6 @@ class BootReceiver : BroadcastReceiver() {
             else c.startService(s)
         }
     }
+
+
 }

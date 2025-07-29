@@ -1,0 +1,53 @@
+<!-- res/layout/activity_message_center.xml -->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app ="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FFFFFF">
+
+    <!-- ① 가이드라인 (초기 28 %) -->
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guide"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        app:layout_constraintGuide_percent="0.28"/>
+
+    <!-- ② (왼쪽) 트리 -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvTree"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:padding="6dp"
+        android:background="#F7F7F7"
+    app:layout_constraintStart_toStartOf="parent"
+    app:layout_constraintEnd_toStartOf="@id/divider"
+    app:layout_constraintTop_toTopOf="parent"
+    app:layout_constraintBottom_toBottomOf="parent"/>
+
+    <!-- ③ 드래그 핸들 -->
+    <View
+        android:id="@+id/divider"
+        android:layout_width="12dp"
+    android:layout_height="match_parent"
+        android:background="#B0B0B0"
+    app:layout_constraintStart_toStartOf="@id/guide"
+
+    app:layout_constraintEnd_toEndOf  ="@id/guide"
+    app:layout_constraintTop_toTopOf  ="parent"
+    app:layout_constraintBottom_toBottomOf="parent"/>
+
+    <!-- ④ (오른쪽) 메시지 -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvMsgs"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:padding="6dp"
+        app:layout_constraintStart_toEndOf="@id/divider"
+        app:layout_constraintEnd_toEndOf  ="parent"
+        app:layout_constraintTop_toTopOf  ="parent"
+        app:layout_constraintBottom_toBottomOf="parent"/>
+
+</androidx.constraintlayout.widget.ConstraintLayout>
