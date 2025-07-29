@@ -1,11 +1,14 @@
+
 package com.example.myapplication
 
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.*
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -20,7 +23,7 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import java.io.*
 import java.nio.charset.StandardCharsets
-import java.util.*
+import java.util.*          // Locale 포함
 
 /** SPP 서버(Foreground Service) */
 class SppServerService : Service() {
@@ -31,9 +34,9 @@ class SppServerService : Service() {
         private const val CHANNEL_STATUS  = "spp_status"
         private const val CHANNEL_MESSAGE = "spp_msg"
 
-        private const val NOTI_FGS   = 1          // 서비스 상태
+        private const val NOTI_FGS   = 1          // Foreground‑Service 상태
         private const val NOTI_STATE = 100        // 연결/해제 상태
-        private var       notiSeq    = 2          // 일반 메시지
+        private var       notiSeq    = 2          // 일반 메시지 알림 id
 
         /** 표준 SPP UUID */
         val SPP_UUID: UUID =
@@ -79,17 +82,27 @@ class SppServerService : Service() {
     }
 
     /*──────────────── 서버 구동 ────────────────*/
-    @SuppressLint("MissingPermission")
+    @SuppressLint("MissingPermission", "ServiceCast")
     private fun launchServer() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            ActivityCompat.checkSelfPermission(
-                this, Manifest.permission.BLUETOOTH_CONNECT
-            ) != PackageManager.PERMISSION_GRANTED) {
-            emitStatus("BLUETOOTH_CONNECT 권한 없음", true); stopSelf(); return
-        }
-        val adapter = BluetoothAdapter.getDefaultAdapter()
-        if (!adapter.isEnabled) { emitStatus("Bluetooth OFF", true); stopSelf(); return }
+        // 1️⃣ BluetoothManager → Adapter
+        val manager  = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter  = manager.adapter                // 대신 getDefaultAdapter() 사용 금지
 
+        // 2️⃣ 권한 체크 (Android 12 이상)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+            != PackageManager.PERMISSION_GRANTED) {
+            emitStatus("BLUETOOTH_CONNECT 권한 없음", true)
+            stopSelf(); return
+        }
+
+        if (adapter == null) {                // 드문 경우: BT 미지원 기기
+            emitStatus("이 기기는 Bluetooth 를 지원하지 않습니다", true)
+            stopSelf(); return
+        }
+        if (!adapter.isEnabled) {             // OFF 상태
+            emitStatus("Bluetooth OFF", true); stopSelf(); return
+        }
         openSockets(adapter)
         emitStatus("SPP(UUID) secure+insecure 대기 중…")
 
@@ -116,8 +129,7 @@ class SppServerService : Service() {
 
     /*──────────────── 클라이언트 처리 ────────────────*/
     private fun handleClient(sock: BluetoothSocket) = scope.launch {
-        showStateNoti("🔵 SPP 연결됨",
-            "PC ${sock.remoteDevice.address} 과 연결되었습니다")
+        showStateNoti("🔵 SPP 연결됨", "PC ${sock.remoteDevice.address} 과 연결되었습니다")
         toast("SPP 연결 완료")
         emitStatus("클라이언트 접속: ${sock.remoteDevice.address}")
 
@@ -125,12 +137,39 @@ class SppServerService : Service() {
             sock.use {
                 val ins = it.inputStream
                 while (true) {
-                    val magic = readExactOrNull(ins, 3) ?: break   // 3바이트 헤더
-                    val ver   = ins.read()                         // 1바이트 버전
+                    val magic = readExactOrNull(ins, 3) ?: break
+                    val ver   = ins.read()            // 1‑byte version
                     when {
                         /* ────────── IMG ────────── */
-                        magic.contentEquals(MAGIC_IMG) -> {
-                            if (ver == 2) {            // ★ v2: img + cat/sub/title/body
+                        magic.contentEquals(MAGIC_IMG) -> when (ver) {
+                            3 -> {    /* v3: catImg + subImg + msgImg + 4‑text */
+                                val dis    = DataInputStream(ins)
+
+                                val imgCat = readExact(ins, dis.readInt())
+                                val imgSub = readExact(ins, dis.readInt())
+                                val imgMsg = readExact(ins, dis.readInt())
+
+                                val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+
+                                /* ▼ 아이콘 캐시(키 중복 시 저장 skip) + Bitmap 생성 */
+                                val bmpCat = saveIfAbsent(cat,             imgCat)
+                                val bmpSub = saveIfAbsent("${cat}_${sub}",    imgSub)   // cat_sub.png
+                                val bmpMsg = saveIfAbsent("${cat}_${sub}_m",  imgMsg)   // cat_sub_m.png
+                                val thumb  = bmpMsg ?: bmpSub ?: bmpCat
+                                /* ▲ 캐싱 완료 */
+
+                                thumb?.let {
+                                    val fullTitle = "[$cat/$sub] $title"
+                                    showImageTextNoti(it, fullTitle, body)
+                                    sendBroadcast(Intent(ACTION_MSG)
+                                        .putExtra(EXTRA_MSG, "🖼️ $fullTitle"))
+                                } ?: emitStatus("Bitmap (v3) 디코딩 실패", true)
+                            }
+
+                            2 -> {    /* v2: single img + cat/sub/title/body */
                                 val dis      = DataInputStream(ins)
                                 val imgData  = readExact(ins, dis.readInt())
                                 val cat      = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
@@ -138,22 +177,24 @@ class SppServerService : Service() {
                                 val title    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
                                 val body     = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
-                                BitmapFactory.decodeByteArray(imgData, 0, imgData.size)?.let { bmp ->
-                                    showImageTextNoti(bmp, "[$cat/$sub] $title", body)
+                                val bmp = BitmapFactory.decodeByteArray(imgData, 0, imgData.size)
+                                bmp?.let {
+                                    val fullTitle = "[$cat/$sub] $title"
+                                    showImageTextNoti(it, fullTitle, body)
                                     sendBroadcast(Intent(ACTION_MSG)
-                                        .putExtra(EXTRA_MSG, "🖼️ $cat>$sub $title"))
-                                } ?: emitStatus("Bitmap 디코딩 실패", true)
+                                        .putExtra(EXTRA_MSG, "🖼️ $fullTitle"))
+                                } ?: emitStatus("Bitmap (v2) 디코딩 실패", true)
+                            }
 
-                            } else {                  // v0 호환 (기존 포맷)
+                            else -> { /* v0 fallback: img + title + body */
                                 try {
-                                    val dis = DataInputStream(ins)
+                                    val dis     = DataInputStream(ins)
                                     val imgData = readExact(ins, dis.readInt())
                                     val title   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
                                     val body    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-
                                     BitmapFactory.decodeByteArray(imgData, 0, imgData.size)?.let { bmp ->
                                         showImageTextNoti(bmp, title, body)
-                                    } ?: emitStatus("Bitmap 디코딩 실패", true)
+                                    } ?: emitStatus("Bitmap (v0) 디코딩 실패", true)
                                 } catch (e: Exception) {
                                     emitStatus("이미지 처리 예외: ${e.message}", true)
                                 }
@@ -162,13 +203,7 @@ class SppServerService : Service() {
 
                         /* ────────── TXT ────────── */
                         magic.contentEquals(MAGIC_TXT) -> when (ver) {
-                            1 -> {                     // v1: title/body
-                                val dis   = DataInputStream(ins)
-                                val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-                                val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-                                showTextNoti(title, body)
-                            }
-                            2 -> {                     // ★ v2: cat/sub/title/body
+                            2 -> {    /* v2: cat/sub/title/body */
                                 val dis   = DataInputStream(ins)
                                 val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
                                 val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
@@ -176,7 +211,13 @@ class SppServerService : Service() {
                                 val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
                                 showTextNoti("[$cat/$sub] $title", body)
                             }
-                            else -> {                  // v0 (LF 두 줄)
+                            1 -> {    /* v1: title/body */
+                                val dis   = DataInputStream(ins)
+                                val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                showTextNoti(title, body)
+                            }
+                            else -> { /* v0: LF‑2줄 */
                                 val title = readLineUtf8(ins)
                                 val body  = readLineUtf8(ins)
                                 showTextNoti(title, body)
@@ -188,19 +229,47 @@ class SppServerService : Service() {
                 }
             }
         } catch (e: Exception) {
-            emitStatus("클라이언트 오류: ${e.message}", true)
+            // 정상적인 연결 종료라면 조용히 넘어가기
+            if (e.message?.contains("bt socket closed", true) == true ||
+                e is EOFException) {
+                Log.i(TAG, "클라이언트 정상 종료")
+            } else {
+                emitStatus("클라이언트 오류: ${e.message}", true)
+            }
         } finally {
             showStateNoti("⚪ SPP 해제", "PC 연결이 종료되었습니다")
             toast("SPP 연결 종료")
         }
     }
+    /*──────────────── 아이콘 캐시 헬퍼 ────────────────*/
+    private fun saveIfAbsent(key: String, data: ByteArray): Bitmap? {
+        if (data.isEmpty()) return null
+
+        val safe = key.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9._-]"), "_")
+        val dir  = File(filesDir, "icons").apply { mkdirs() }
+        val file = File(dir, "$safe.png")
+
+        if (!file.exists()) {
+            try {
+                file.writeBytes(data)
+                Log.i(TAG, "아이콘 저장됨  →  ${file.absolutePath}")   // ★ 저장 경로 로그
+            } catch (e: IOException) {
+                emitStatus("아이콘 저장 실패($safe): ${e.message}", true)
+            }
+        } else {
+            Log.i(TAG, "아이콘 이미 존재 →  ${file.absolutePath}")   // ★ 캐시 히트 로그
+        }
+
+        return BitmapFactory.decodeByteArray(data, 0, data.size)
+    }
+
 
     /*─────────── I/O 헬퍼 ───────────*/
     private fun readExact(ins: InputStream, size: Int): ByteArray =
-        ByteArray(size).also { b ->
+        ByteArray(size).also { buf ->
             var off = 0
             while (off < size) {
-                val r = ins.read(b, off, size - off)
+                val r = ins.read(buf, off, size - off)
                 if (r < 0) throw EOFException()
                 off += r
             }
@@ -209,22 +278,21 @@ class SppServerService : Service() {
     private fun readExactOrNull(ins: InputStream, size: Int): ByteArray? =
         try { readExact(ins, size) } catch (_: EOFException) { null }
 
-    private fun readLineUtf8(ins: InputStream): String {
-        val buf = ByteArrayOutputStream()
-        while (true) {
-            val b = ins.read()
-            if (b == -1 || b == '\n'.code) break
-            buf.write(b)
+    private fun readLineUtf8(ins: InputStream): String =
+        buildString {
+            while (true) {
+                val b = ins.read()
+                if (b == -1 || b == '\n'.code) break
+                append(b.toChar())
+            }
         }
-        return buf.toString(Charsets.UTF_8.name())
-    }
 
     /*─────────── 알림 & 로그 ───────────*/
     private fun emitStatus(text: String, err: Boolean = false) {
-        val t = if (err) "[ERR] $text" else text
-        if (err) Log.w(TAG, t) else Log.i(TAG, t)
-        sendBroadcast(Intent(ACTION_STATUS).putExtra(EXTRA_STATUS, t))
-        nm().notify(NOTI_FGS, buildFgsNoti(t))
+        val msg = if (err) "[ERR] $text" else text
+        if (err) Log.w(TAG, msg) else Log.i(TAG, msg)
+        sendBroadcast(Intent(ACTION_STATUS).putExtra(EXTRA_STATUS, msg))
+        nm().notify(NOTI_FGS, buildFgsNoti(msg))
     }
 
     private fun buildFgsNoti(text: String) =
@@ -235,7 +303,7 @@ class SppServerService : Service() {
             .setOngoing(true)
             .build()
 
-    /*────────── 메시지 알림 ──────────*/
+    /*────────── 메시지 알림 (텍스트/이미지) ──────────*/
     private fun showTextNoti(title: String, body: String) =
         nm().notify(
             notiSeq++,
@@ -304,7 +372,7 @@ class SppServerService : Service() {
             })
     }
 
-    /*────────── 확장 & 헬퍼 ──────────*/
+    /*────────── 기타 헬퍼 ──────────*/
     private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     private fun toast(msg: String) =
         Handler(Looper.getMainLooper()).post {
