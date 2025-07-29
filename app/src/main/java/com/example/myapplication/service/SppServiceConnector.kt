@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.myapplication.service
 
 import android.content.ComponentName
 import android.content.Context
@@ -6,8 +6,6 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Handler
 import android.os.IBinder
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 object SppServiceConnector {

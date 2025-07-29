@@ -8,6 +8,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.example.myapplication.service.SppServiceConnector
 
 class ReadSyncWorker(ctx: Context, params: WorkerParameters)
 : CoroutineWorker(ctx, params) {

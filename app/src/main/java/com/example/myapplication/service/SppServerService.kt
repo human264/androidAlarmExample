@@ -1,7 +1,7 @@
-// SppServerService.kt  ── FINAL
-package com.example.myapplication
-import android.util.Base64
+package com.example.myapplication.service
+
 import android.Manifest
+import android.R
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,24 +9,39 @@ import android.app.Service
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.*
-import android.os.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.os.Binder
+import android.os.Build
+import android.text.format.DateFormat
+import android.util.Base64
 import android.util.Log
 import android.widget.RemoteViews
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
-import androidx.core.util.Preconditions.checkArgument
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.example.myapplication.database.AppDatabase
 import com.example.myapplication.database.MessageEntity
-import kotlinx.coroutines.*
-import java.io.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.EOFException
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
-import java.util.*
+import java.util.Locale
+import java.util.UUID
 
 /* ─────────────────────────────────────────── */
 /*  SPP 서버 + 메시지 수신/저장 + UI 브로드캐스트  */
@@ -58,7 +73,7 @@ class SppServerService : Service() {
     }
 
     /* ---------- DB ---------- */
-    private val dao by lazy { AppDatabase.getInstance(applicationContext).messageDao() }
+    private val dao by lazy { AppDatabase.Companion.getInstance(applicationContext).messageDao() }
 
     /* ---------- Binder ---------- */
     inner class LocalBinder : Binder() {
@@ -91,7 +106,7 @@ class SppServerService : Service() {
     /* ───────────── 서버 기동 ───────────── */
     @SuppressLint("MissingPermission")
     private fun launchServer() {
-        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        val adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
             != PackageManager.PERMISSION_GRANTED) { stopSelf(); return }
@@ -273,7 +288,7 @@ class SppServerService : Service() {
         nm().notify(
             notiSeq++,
             NotificationCompat.Builder(this, CHANNEL_MESSAGE)
-                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setSmallIcon(R.drawable.stat_notify_chat)
                 .setContentTitle(title).setContentText(body)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -290,19 +305,19 @@ class SppServerService : Service() {
             Bitmap.createScaledBitmap(bmpOrig, 128, 128, true) else bmpOrig
 
         val catSub = title.substringBefore(']').trim('[', ' ')
-        val time   = android.text.format.DateFormat.format("HH:mm", System.currentTimeMillis())
+        val time   = DateFormat.format("HH:mm", System.currentTimeMillis())
 
-        val rv = RemoteViews(packageName, R.layout.notif_popup).apply {
-            setImageViewBitmap(R.id.ivThumb , bmp)
-            setTextViewText (R.id.tvCatSub , catSub)
-            setTextViewText (R.id.tvTime   , time)
-            setTextViewText (R.id.tvTitle  , title.substringAfter("] ").trim())
-            setTextViewText (R.id.tvDetail , "")
-            setTextViewText (R.id.tvBody   , body)
+        val rv = RemoteViews(packageName, com.example.myapplication.R.layout.notif_popup).apply {
+            setImageViewBitmap(com.example.myapplication.R.id.ivThumb , bmp)
+            setTextViewText (com.example.myapplication.R.id.tvCatSub , catSub)
+            setTextViewText (com.example.myapplication.R.id.tvTime   , time)
+            setTextViewText (com.example.myapplication.R.id.tvTitle  , title.substringAfter("] ").trim())
+            setTextViewText (com.example.myapplication.R.id.tvDetail , "")
+            setTextViewText (com.example.myapplication.R.id.tvBody   , body)
         }
 
         val noti = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.stat_notify_chat)
             .setContentTitle(title)              // 접근성
             .setCustomContentView(rv)
             .setCustomBigContentView(rv)
@@ -320,7 +335,7 @@ class SppServerService : Service() {
         nm().notify(
             NOTI_STATE,
             NotificationCompat.Builder(this, CHANNEL_STATUS)
-                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setSmallIcon(R.drawable.stat_sys_data_bluetooth)
                 .setContentTitle(t).setContentText(b)
                 .setPriority(NotificationCompat.PRIORITY_HIGH).build()
         )
@@ -398,7 +413,7 @@ class SppServerService : Service() {
     /* ---------- 채널 & 상태 ---------- */
     private fun buildFgsNoti(text: String) =
         NotificationCompat.Builder(this, CHANNEL_STATUS)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("SPP Server").setContentText(text)
             .setOngoing(true).build()
 

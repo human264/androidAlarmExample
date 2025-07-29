@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.myapplication.adapter
 
 import android.content.res.Resources
 import android.graphics.Typeface
@@ -8,6 +8,9 @@ import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
 import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.bumptech.glide.signature.ObjectKey
+import com.example.myapplication.R
+import com.example.myapplication.dto.UiCategory
+import com.example.myapplication.dto.UiSubCategory
 import java.io.File
 
 class TreeAdapter(
@@ -20,7 +23,7 @@ class TreeAdapter(
         get() = buildList {
             cats.forEach { c ->
                 add(true to c.id)
-                subs.filter { it.catId == c.id }.forEach { add(false to it.id) }
+                subs.filter { it.catId == c.id  }.forEach { add(false to it.id) }
             }
         }
 

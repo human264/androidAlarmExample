@@ -68,7 +68,7 @@
 
         <!-- SPP Foreground Service -->
         <service
-            android:name=".SppServerService"
+            android:name=".service.SppServerService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />

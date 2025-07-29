@@ -20,4 +20,15 @@ interface MessageDao {
 
     @Query("UPDATE message SET synced = 1 WHERE id IN (:ids)")
     suspend fun confirmSynced(ids: List<String>)
+
+    @Query("SELECT DISTINCT catId FROM message")
+    suspend fun distinctCategories(): List<String>
+
+    @Query("SELECT DISTINCT subId FROM message WHERE catId = :catId")
+    suspend fun distinctSubCategories(catId: String): List<String>
+    @Query("SELECT * FROM message")
+    suspend fun getAllMessages(): List<MessageEntity>
+
+
+
 }

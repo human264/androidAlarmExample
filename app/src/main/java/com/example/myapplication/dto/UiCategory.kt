@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.myapplication.dto
 
 
 /* ───────── 카테고리 ───────── */
