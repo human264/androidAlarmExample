@@ -19,7 +19,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import java.io.*
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.*
 
@@ -126,52 +125,58 @@ class SppServerService : Service() {
             sock.use {
                 val ins = it.inputStream
                 while (true) {
-                    val magic = readExactOrNull(ins, 3) ?: break        // EOF → while‑exit
+                    val magic = readExactOrNull(ins, 3) ?: break   // 3바이트 헤더
+                    val ver   = ins.read()                         // 1바이트 버전
                     when {
-                        /* ─── IMG 프로토콜 (이전과 동일) ─── */
+                        /* ────────── IMG ────────── */
                         magic.contentEquals(MAGIC_IMG) -> {
-                            try {
-                                val dis = DataInputStream(ins)
+                            if (ver == 2) {            // ★ v2: img + cat/sub/title/body
+                                val dis      = DataInputStream(ins)
+                                val imgData  = readExact(ins, dis.readInt())
+                                val cat      = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val sub      = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val title    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val body     = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
-                                val imgLen   = dis.readInt()
-                                if (imgLen !in 1..1_000_000) {
-                                    emitStatus("이미지 len=$imgLen 오류", true); break
-                                }
-                                val imgData  = readExact(ins, imgLen)
-
-                                val titleLen = dis.readInt()
-                                val title    = String(readExact(ins, titleLen), StandardCharsets.UTF_8)
-
-                                val bodyLen  = dis.readInt()
-                                val body     = String(readExact(ins, bodyLen), StandardCharsets.UTF_8)
-
-                                /* 비트맵 디코딩 및 알림 */
-                                BitmapFactory.decodeByteArray(imgData, 0, imgLen)?.let { bmp ->
-                                    showImageTextNoti(bmp, title, body)
-                                    // 필요하다면 내부 브로드캐스트
-                                    sendBroadcast(Intent(ACTION_MSG).putExtra(EXTRA_MSG, "🖼️ $title: $body"))
+                                BitmapFactory.decodeByteArray(imgData, 0, imgData.size)?.let { bmp ->
+                                    showImageTextNoti(bmp, "[$cat/$sub] $title", body)
+                                    sendBroadcast(Intent(ACTION_MSG)
+                                        .putExtra(EXTRA_MSG, "🖼️ $cat>$sub $title"))
                                 } ?: emitStatus("Bitmap 디코딩 실패", true)
 
-                            } catch (e: Exception) {
-                                emitStatus("이미지 처리 예외: ${e.message}", true)
+                            } else {                  // v0 호환 (기존 포맷)
+                                try {
+                                    val dis = DataInputStream(ins)
+                                    val imgData = readExact(ins, dis.readInt())
+                                    val title   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                    val body    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+
+                                    BitmapFactory.decodeByteArray(imgData, 0, imgData.size)?.let { bmp ->
+                                        showImageTextNoti(bmp, title, body)
+                                    } ?: emitStatus("Bitmap 디코딩 실패", true)
+                                } catch (e: Exception) {
+                                    emitStatus("이미지 처리 예외: ${e.message}", true)
+                                }
                             }
                         }
 
-
-                        /* ─── TXT 프로토콜 ─── */
-                        magic.contentEquals(MAGIC_TXT) -> {
-                            val version = ins.read()
-                            if (version == 1) {
-                                /* 새 v1 포맷: [TXT][01][tLen][title…][bLen][body…] */
-                                val tLen = DataInputStream(ins).readInt()
-                                val titleBytes = readExact(ins, tLen)
-                                val bLen = DataInputStream(ins).readInt()
-                                val bodyBytes  = readExact(ins, bLen)
-                                val title = String(titleBytes, StandardCharsets.UTF_8)
-                                val body  = String(bodyBytes , StandardCharsets.UTF_8)
+                        /* ────────── TXT ────────── */
+                        magic.contentEquals(MAGIC_TXT) -> when (ver) {
+                            1 -> {                     // v1: title/body
+                                val dis   = DataInputStream(ins)
+                                val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
                                 showTextNoti(title, body)
-                            } else {
-                                /* 구버전(헤더 뒤 LF 기준 두 줄) 대비 호환 */
+                            }
+                            2 -> {                     // ★ v2: cat/sub/title/body
+                                val dis   = DataInputStream(ins)
+                                val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+                                showTextNoti("[$cat/$sub] $title", body)
+                            }
+                            else -> {                  // v0 (LF 두 줄)
                                 val title = readLineUtf8(ins)
                                 val body  = readLineUtf8(ins)
                                 showTextNoti(title, body)
@@ -208,11 +213,12 @@ class SppServerService : Service() {
         val buf = ByteArrayOutputStream()
         while (true) {
             val b = ins.read()
-            if (b == -1 || b == '\n'.code) break      // EOF 또는 LF → 종료
+            if (b == -1 || b == '\n'.code) break
             buf.write(b)
         }
         return buf.toString(Charsets.UTF_8.name())
     }
+
     /*─────────── 알림 & 로그 ───────────*/
     private fun emitStatus(text: String, err: Boolean = false) {
         val t = if (err) "[ERR] $text" else text
