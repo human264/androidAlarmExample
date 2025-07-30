@@ -3,6 +3,7 @@ package com.example.myapplication.service
 import android.Manifest
 import android.R
 import android.annotation.SuppressLint
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -48,7 +49,12 @@ import java.util.UUID
 /*  SPP 서버 + 메시지 수신/저장 + UI 브로드캐스트  */
 /* ─────────────────────────────────────────── */
 class SppServerService : Service() {
+
+
+
     companion object {
+        @Volatile private var bulkSync = false
+        private const val MAX_ACTIVE_NOTI = 24
         private const val TAG = "SppServer"
         private const val CHANNEL_STATUS = "spp_status"
         private const val CHANNEL_MESSAGE = "spp_msg"
@@ -64,8 +70,10 @@ class SppServerService : Service() {
         private const val VER_TXT_V4: Byte = 0x04
         private const val OP_READ_FROM_PHONE: Byte = 0x01
         private const val OP_READ_TO_PHONE: Byte = 0x02        // PC  ➜  Phone
+        private const val OP_UNREAD_TO_PHONE: Byte = 0x03        // PC  ➜  Phone
         private const val VER_TXT_V5: Byte = 0x05
-
+        private const val OP_DEVICE_RESET : Byte = 0x10   // (기존 선언 그대로)
+        private const val OP_SYNC_END     : Byte = 0x11   // (기존 선언 그대로)
         /* Activity 갱신용 브로드캐스트 필드 */
         const val ACTION_MSG = "com.example.myapplication.ACTION_SPP_MSG"
         const val ACTION_SYNC = "com.example.myapplication.ACTION_SYNC"     // ★
@@ -257,27 +265,32 @@ class SppServerService : Service() {
         )
     }
 
-
     /* ─────────── TXT ─────────── */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private suspend fun handleTxt(ins: InputStream, ver: Int) {
         val dis = DataInputStream(ins)
 
-        // ① READ‑SYNC (v4)
+        /* ① READ / RESET / SYNC 제어‑패킷 (v4) */
         if (ver == VER_TXT_V4.toInt()) {
             val op = dis.readByte()
-            if (op == OP_READ_TO_PHONE) { handleReadSyncFromPc(dis); return }
-            if (op == OP_READ_FROM_PHONE) {
-                val cnt = dis.readUnsignedShort()
-                repeat(cnt) {
-                    ins.skipNBytes(dis.readUnsignedShort().toLong())
+
+            when (op) {
+                OP_READ_TO_PHONE   -> { handleReadSyncFromPc(dis);   return }
+                OP_UNREAD_TO_PHONE -> { handleUnreadSyncFromPc(dis); return }
+                OP_READ_FROM_PHONE -> {                 // echo 무시
+                    val cnt = dis.readUnsignedShort()
+                    repeat(cnt) { ins.skipNBytes(dis.readUnsignedShort().toLong()) }
+                    Log.i(TAG, "READ‑sync echo 무시 ($cnt)")
+                    return
                 }
-                Log.i(TAG, "READ‑sync echo 무시 ($cnt)")
-                return
+
+                /* ──── ★ 추가된 두 가지 ──── */
+                OP_DEVICE_RESET    -> { handleDeviceReset(); return }
+                OP_SYNC_END        -> { handleSyncEnd();     return }
             }
         }
 
-        // ② TXT‑v5 : 고유 id 포함
+        /* ② TXT‑v5 : 고유 id 포함 */
         if (ver == VER_TXT_V5.toInt()) {
             val idLen = dis.readUnsignedShort()
             val id    = String(readExact(ins, idLen), StandardCharsets.UTF_8)
@@ -293,9 +306,11 @@ class SppServerService : Service() {
             return
         }
 
-        // ③ legacy TXT (v1 ~ v3)
-        val cat   = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else "text"
-        val sub   = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else ""
+        /* ③ legacy TXT (v1~v3) */
+        val cat   = if (ver >= 2)
+            String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else "text"
+        val sub   = if (ver >= 2)
+            String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else ""
         val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
         val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
@@ -305,6 +320,55 @@ class SppServerService : Service() {
         persistMessage(newId, cat, sub, title, body, "")
         broadcastMsg(newId, cat, sub, title, body, null, null, null)
     }
+
+    private suspend fun handleDeviceReset() {
+        bulkSync = true // ★ NEW
+        Log.i(TAG, "DEVICE_RESET ← PC  ▶ 모든 메시지/아이콘 삭제")
+        /* 1) DB 삭제 */
+        dao.deleteAll()                                              // ← MessageDao 에 deleteAll() 필요
+        /* 2) 캐시 아이콘 지우기 */
+        kotlin.runCatching {
+            File(filesDir, "icons").deleteRecursively()
+        }
+        /* 3) UI 알림 */
+        LocalBroadcastManager.getInstance(this).sendBroadcast(
+            Intent(ACTION_SYNC).putExtra("reset", true)
+        )
+    }
+
+    private suspend fun handleSyncEnd() {                             // ★ NEW
+        Log.i(TAG, "SYNC_END ← PC  ▶ Full-Sync 완료")
+
+        /* 아직 synced=false 인 레코드 모두 true 로 마킹 */
+        dao.confirmSyncedAll()                                       // ← DAO 메서드 추가
+        bulkSync = false
+        LocalBroadcastManager.getInstance(this).sendBroadcast(
+            Intent(ACTION_SYNC).putExtra("done", true)
+        )
+    }
+
+    private inline fun notifyUnlessBulk(id: Int,
+                                        build: () -> Notification) {
+        if (bulkSync) return          // 동기화 중엔 출력 안 함
+        safeNotify(id, build())
+    }
+
+
+    private fun safeNotify(id: Int, noti: Notification) {
+        val nm = nm()
+        if (Build.VERSION.SDK_INT >= 23) {
+            val actives = nm.activeNotifications
+                .filter { it.id != NOTI_STATE }    // 상태표시 알림은 제외
+            if (actives.size >= MAX_ACTIVE_NOTI) {
+                actives.minByOrNull { it.notification.`when` }?.let {
+                    nm.cancel(it.tag, it.id)
+                }
+            }
+        }
+        nm.notify(id, noti)
+    }
+
+
 
     /* ─────────── IMG v5 ─────────── */
     private fun handleImgV5(ins: InputStream) {
@@ -353,9 +417,23 @@ class SppServerService : Service() {
         }
         Log.i(TAG, "READ‑sync ← PC : ${ids.size}건")
 
-        // DB 업데이트
+        /* handleReadSyncFromPc() 마지막에 ↓ 추가 */
         scope.launch {
-            dao.markReadList(ids)               // ★ DAO 에 새로 추가된 메서드
+            val s = activeSocket ?: return@launch
+            val dos = DataOutputStream(s.outputStream)    // 재사용 가능
+
+            synchronized(dos) {
+                dos.write(byteArrayOf(0x54, 0x58, 0x54))  // "TXT"
+                dos.writeByte(VER_TXT_V4.toInt())         // 0x04
+                dos.writeByte(OP_READ_FROM_PHONE.toInt()) // echo opcode
+                dos.writeShort(ids.size)                  // count
+                ids.forEach { id ->
+                    val b = id.toByteArray(StandardCharsets.UTF_8)
+                    dos.writeShort(b.size)
+                    dos.write(b)
+                }
+                dos.flush()
+            }
         }
 
         // UI 갱신용 broadcast (선택)
@@ -411,8 +489,7 @@ class SppServerService : Service() {
 
     /* ───────── 알림 ───────── */
     private fun showTextNoti(title: String, body: String) =
-        nm().notify(
-            notiSeq++,
+        notifyUnlessBulk(notiSeq++) {
             NotificationCompat.Builder(this, CHANNEL_MESSAGE)
                 .setSmallIcon(R.drawable.stat_notify_chat)
                 .setContentTitle(title).setContentText(body)
@@ -420,7 +497,7 @@ class SppServerService : Service() {
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setDefaults(NotificationCompat.DEFAULT_ALL)
                 .setAutoCancel(true).build()
-        )
+        }
 
     private fun showImageTextNoti(bmpOrig: Bitmap?, title: String, body: String) {
         if (bmpOrig == null) {           // 안전‑가드
@@ -457,7 +534,8 @@ class SppServerService : Service() {
             .setAutoCancel(true)
             .build()
 
-        nm().notify(notiSeq++, noti)
+//        nm().notify(notiSeq++, noti)
+        notifyUnlessBulk(notiSeq++, { noti })
     }
 
     private fun showStateNoti(t: String, b: String) =
@@ -506,6 +584,27 @@ class SppServerService : Service() {
             waited += 250
         }
         Log.w(TAG, "syncReadStatus: socket null – postpone (${pending.size})")
+    }
+    /* ★ 추가: 안읽음‑sync 처리 루틴 */
+    private fun handleUnreadSyncFromPc(dis: DataInputStream) {
+        val cnt = dis.readUnsignedShort()
+        val ids = mutableListOf<String>()
+        repeat(cnt) {
+            val len = dis.readUnsignedShort()
+            ids += String(readExact(dis, len), StandardCharsets.UTF_8)
+        }
+        Log.i(TAG, "UNREAD‑sync ← PC : ${ids.size}건")
+
+        scope.launch {
+            dao.markUnreadList(ids)       // ★ DAO에 read=false 로 바꾸는 메서드 추가
+        }
+
+        /* 필요시 UI 갱신 브로드캐스트 */
+        LocalBroadcastManager.getInstance(this).sendBroadcast(
+            Intent(ACTION_SYNC).apply {
+                putStringArrayListExtra("unreadIds", ArrayList(ids))
+            }
+        )
     }
 
     private suspend fun sendReadSync(sock: BluetoothSocket,

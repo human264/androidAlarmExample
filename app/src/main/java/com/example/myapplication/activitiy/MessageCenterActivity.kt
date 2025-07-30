@@ -24,6 +24,7 @@ import com.example.myapplication.dto.UiCategory
 import com.example.myapplication.dto.UiMessage
 import com.example.myapplication.dto.UiSubCategory
 import com.example.myapplication.service.SppServerService
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.*
@@ -241,13 +242,43 @@ class MessageCenterActivity : AppCompatActivity() {
     private val sppReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent) {
             when (i.action) {
-                SppServerService.ACTION_MSG -> addIncoming(i)  // 기존 메시지
-                SppServerService.ACTION_SYNC -> {                // ★ READ‑SYNC
-                    loadCategoryDataFromDb()                     // DB 전체 리로드
+                SppServerService.ACTION_MSG  -> addIncoming(i)
+
+                SppServerService.ACTION_SYNC -> {             // ★ READ/UNREAD‑sync
+                    val unread = i.getStringArrayListExtra("unreadIds")
+                    val read   = i.getStringArrayListExtra("ids")
+
+                    // ① msgStore 내부 플래그만 수정 — UI 즉시 반응
+                    var changed = false
+                    unread?.forEach { id ->
+                        msgStore.find { it.id == id }?.let { m ->
+                            if (m.read) { m.read = false; changed = true }
+                        }
+                    }
+                    read?.forEach { id ->
+                        msgStore.find { it.id == id }?.let { m ->
+                            if (!m.read) { m.read = true ; changed = true }
+                        }
+                    }
+
+                    if (changed) {
+                        recalcUnread()
+                        treeAdapter.notifyDataSetChanged()
+                        msgAdapter.notifyDataSetChanged()
+                    }
+
+                    // ② 여전히 DB 와의 최종 정합성은 유지하고 싶으면
+                    //    (예: 앱이 백그라운드였다가 복귀한 경우)
+                    //    지연 호출로 전체 리로드
+                    lifecycleScope.launch {
+                        delay(300)          // UI 깜빡임 줄이려고 살짝 지연
+                        loadCategoryDataFromDb()
+                    }
                 }
             }
         }
     }
+
 
 
     override fun onResume() {

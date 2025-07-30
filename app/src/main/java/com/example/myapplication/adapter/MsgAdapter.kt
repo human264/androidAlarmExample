@@ -86,6 +86,9 @@ class MsgAdapter(
 
                     /* 4‑3 상위 UI 업데이트 콜백 */
                     onRead()
+                } else {                     // → 안읽음으로 변경
+                    msg.read = false
+                    msg.synced = false       // ★
                 }
             }
         }
