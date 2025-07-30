@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.*
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.IBinder
 import android.util.Log
 import android.view.MotionEvent
 import android.view.View
@@ -31,11 +32,11 @@ import kotlin.math.max
 
 class MessageCenterActivity : AppCompatActivity() {
 
-    private val COLOR_IDLE   = 0xFFB0B0B0.toInt()
+    private val COLOR_IDLE = 0xFFB0B0B0.toInt()
     private val COLOR_ACTIVE = 0xFF2979FF.toInt()
-    private var dragStartX       = 0f
+    private var dragStartX = 0f
     private var dragStartPercent = 0f
-    private var splitterPercent  = 0.30f
+    private var splitterPercent = 0.30f
 
     private val cats = mutableListOf<UiCategory>()
     private val subs = mutableListOf<UiSubCategory>()
@@ -45,9 +46,35 @@ class MessageCenterActivity : AppCompatActivity() {
     private var selectedSub: String? = null
 
     private lateinit var treeAdapter: TreeAdapter
-    private lateinit var msgAdapter : MsgAdapter
-
+    private lateinit var msgAdapter: MsgAdapter
+    private lateinit var sppBinder: SppServerService.LocalBinder
+    private var bound = false
     private val dao by lazy { AppDatabase.getInstance(this).messageDao() }
+    private val svcConn = object : ServiceConnection {
+        override fun onServiceConnected(c: ComponentName, b: IBinder) {
+            sppBinder = b as SppServerService.LocalBinder
+            bound = true
+            Log.i("MsgCenter", "SPP Service bound")
+        }
+
+        override fun onServiceDisconnected(c: ComponentName) {
+            bound = false
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        /* 서비스가 이미 돌고 있으니 bind 만 */
+        Intent(this, SppServerService::class.java).also {
+            bindService(it, svcConn, Context.BIND_AUTO_CREATE)
+        }
+    }
+
+    override fun onStop() {
+        if (bound) unbindService(svcConn)
+        bound = false
+        super.onStop()
+    }
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -61,26 +88,34 @@ class MessageCenterActivity : AppCompatActivity() {
 
         findViewById<RecyclerView>(R.id.rvTree).apply {
             layoutManager = LinearLayoutManager(context)
-            adapter       = treeAdapter
+            adapter = treeAdapter
         }
-
         msgAdapter = MsgAdapter(
             data = emptyList(),
-            dao = dao,
-            ioScope = lifecycleScope,
-            onRead = {
+            onRead = {                         // UI만 갱신
                 recalcUnread()
                 treeAdapter.notifyDataSetChanged()
-            }
-        )
+            },
+            dao = dao,
+            ioScope = lifecycleScope,
+            /* ⑤  읽음‑동기화 람다 (Service 통해) */
+            syncRead = {
+                if (bound) {
+                    sppBinder.syncReadStatus()
+                } else {
+                    Log.w("MsgCenter", "Service not bound – skip sync")
+                }
+            })
+
         findViewById<RecyclerView>(R.id.rvMsgs).apply {
             layoutManager = LinearLayoutManager(context)
-            adapter       = msgAdapter
+            adapter = msgAdapter
         }
 
         initSplitter()
         loadCategoryDataFromDb()
     }
+
     private fun loadCategoryDataFromDb() {
         lifecycleScope.launch {
             val catIds = dao.distinctCategories()
@@ -130,17 +165,18 @@ class MessageCenterActivity : AppCompatActivity() {
             subs.clear(); subs += loadedSubs
 
             // 메시지 저장소 초기화
-            msgStore.clear(); msgStore += allMsgs.map {
-            val path = it.iconPath?.takeIf { p -> p.isNotBlank() && File(p).exists() } ?: ""
+            msgStore.clear(); msgStore += allMsgs.map { m ->
+            val path = m.iconPath?.takeIf { p -> p.isNotBlank() && File(p).exists() } ?: ""
             UiMessage(
-                id = it.id,
-                catId = it.catId,
-                subId = it.subId,
-                title = it.title,
-                body = it.body,
-                ts = it.ts,
+                id       = m.id,
+                catId    = m.catId,
+                subId    = m.subId,
+                title    = m.title,
+                body     = m.body,
+                ts       = m.ts,
                 iconPath = path,
-                read = it.read
+                read     = m.read,
+                synced   = m.synced      // ★ 추가
             )
         }
 
@@ -152,8 +188,8 @@ class MessageCenterActivity : AppCompatActivity() {
 
 
     private fun initSplitter() {
-        val divider    = findViewById<View>(R.id.divider)
-        val guide      = findViewById<Guideline>(R.id.guide)
+        val divider = findViewById<View>(R.id.divider)
+        val guide = findViewById<Guideline>(R.id.guide)
         val rootLayout = findViewById<ConstraintLayout>(R.id.rootLayout)
 
         splitterPercent =
@@ -164,48 +200,64 @@ class MessageCenterActivity : AppCompatActivity() {
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     divider.setBackgroundColor(COLOR_ACTIVE)
-                    dragStartX       = ev.rawX
+                    dragStartX = ev.rawX
                     dragStartPercent =
                         (guide.layoutParams as ConstraintLayout.LayoutParams).guidePercent
                     true
                 }
+
                 MotionEvent.ACTION_MOVE -> {
                     val w = max(rootLayout.width.toFloat(), 1f)
                     val percent = (dragStartPercent + (ev.rawX - dragStartX) / w)
                         .coerceIn(0.15f, 0.85f)
                     (guide.layoutParams as ConstraintLayout.LayoutParams).apply {
-                        guidePercent      = percent
+                        guidePercent = percent
                         guide.layoutParams = this
                     }
                     splitterPercent = percent
                     rootLayout.requestLayout()
                     true
                 }
+
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     divider.setBackgroundColor(COLOR_IDLE)
                     true
                 }
+
                 else -> false
             }
         }
 
         val initP = if (resources.configuration.orientation ==
-            Configuration.ORIENTATION_PORTRAIT) 0.40f else 0.30f
+            Configuration.ORIENTATION_PORTRAIT
+        ) 0.40f else 0.30f
         (guide.layoutParams as ConstraintLayout.LayoutParams).apply {
-            guidePercent      = initP
+            guidePercent = initP
             guide.layoutParams = this
         }
         splitterPercent = initP
     }
 
     private val sppReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent) = addIncoming(i)
+        override fun onReceive(c: Context?, i: Intent) {
+            when (i.action) {
+                SppServerService.ACTION_MSG -> addIncoming(i)  // 기존 메시지
+                SppServerService.ACTION_SYNC -> {                // ★ READ‑SYNC
+                    loadCategoryDataFromDb()                     // DB 전체 리로드
+                }
+            }
+        }
     }
+
 
     override fun onResume() {
         super.onResume()
         LocalBroadcastManager.getInstance(this).registerReceiver(
-            sppReceiver, IntentFilter(SppServerService.ACTION_MSG)
+            sppReceiver,
+            IntentFilter().apply {
+                addAction(SppServerService.ACTION_MSG)
+                addAction(SppServerService.ACTION_SYNC)   // ★
+            }
         )
     }
 
@@ -226,19 +278,20 @@ class MessageCenterActivity : AppCompatActivity() {
     }
 
     private fun addIncoming(i: Intent) {
+        /* ---------- 반드시 패킷 id 사용 ---------- */
+        val id   = i.getStringExtra(SppServerService.EXTRA_ID)
+            ?: UUID.randomUUID().toString()          // fallback
 
-
-
-        val cat   = i.getStringExtra(SppServerService.EXTRA_CAT ) ?: "misc"
-        val sub   = i.getStringExtra(SppServerService.EXTRA_SUB ) ?: ""
+        val cat = i.getStringExtra(SppServerService.EXTRA_CAT) ?: "misc"
+        val sub = i.getStringExtra(SppServerService.EXTRA_SUB) ?: ""
         val title = i.getStringExtra(SppServerService.EXTRA_TITLE) ?: "(no‑title)"
-        val body  = i.getStringExtra(SppServerService.EXTRA_BODY ) ?: ""
+        val body = i.getStringExtra(SppServerService.EXTRA_BODY) ?: ""
 
 
         val iconMsg = i.getStringExtra("icon_msg")?.takeUnless { it.isBlank() }
         val iconSub = i.getStringExtra("icon_sub")?.takeUnless { it.isBlank() } ?: iconMsg
         val iconCat = i.getStringExtra("icon_cat")?.takeUnless { it.isBlank() } ?: iconMsg
-        val bestIcon= iconMsg ?: iconSub ?: iconCat ?: ""
+        val bestIcon = iconMsg ?: iconSub ?: iconCat ?: ""
 
         val subId = if (sub.isBlank()) "" else "${cat}_${sub}"
 
@@ -256,13 +309,13 @@ class MessageCenterActivity : AppCompatActivity() {
 
         Log.d("addIncoming", "cat=$cat, sub=$sub, subId=$subId")
         msgStore += UiMessage(
-            id      = UUID.randomUUID().toString(),
-            catId   = cat,
-            subId   = subId,
-            title   = title,
-            body    = body,
-            ts      = System.currentTimeMillis(),
-            iconPath= bestIcon
+            id       = id,                // ← PC 와 동일한 id 저장
+            catId = cat,
+            subId = subId,
+            title = title,
+            body = body,
+            ts = System.currentTimeMillis(),
+            iconPath = bestIcon
         )
 
         recalcUnread()
@@ -278,7 +331,7 @@ class MessageCenterActivity : AppCompatActivity() {
         subs.forEach { s -> s.unreadCount = subMap[s.id] ?: 0 }
 
         cats.forEach { c ->
-            val direct   = subMap[c.id] ?: 0
+            val direct = subMap[c.id] ?: 0
             val fromSubs = subs.filter { it.catId == c.id }.sumOf { it.unreadCount }
             c.unreadCount = direct + fromSubs
         }
@@ -288,7 +341,7 @@ class MessageCenterActivity : AppCompatActivity() {
         super.onConfigurationChanged(newConfig)
         val guide = findViewById<Guideline>(R.id.guide)
         (guide.layoutParams as ConstraintLayout.LayoutParams).apply {
-            guidePercent      = splitterPercent
+            guidePercent = splitterPercent
             guide.layoutParams = this
         }
     }

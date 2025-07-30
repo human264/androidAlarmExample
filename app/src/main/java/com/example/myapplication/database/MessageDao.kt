@@ -15,6 +15,10 @@ interface MessageDao {
     @Query("UPDATE message SET read = 1, synced = 0 WHERE id = :id")
     suspend fun markRead(id: String)
 
+
+    @Query("UPDATE message SET read = 1, synced = 0 WHERE id IN (:ids)")
+    suspend fun markReadList(ids: List<String>)
+
     @Query("SELECT * FROM message WHERE read = 1 AND synced = 0")
     suspend fun pendingReadSync(): List<MessageEntity>
 
@@ -29,6 +33,6 @@ interface MessageDao {
     @Query("SELECT * FROM message")
     suspend fun getAllMessages(): List<MessageEntity>
 
-
-
+    @Query("UPDATE message SET read = 1, synced = 1 WHERE id IN(:ids)")
+    suspend fun markAsRead(ids: List<String>)
 }

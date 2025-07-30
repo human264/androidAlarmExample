@@ -29,6 +29,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
@@ -47,44 +48,55 @@ import java.util.UUID
 /*  SPP 서버 + 메시지 수신/저장 + UI 브로드캐스트  */
 /* ─────────────────────────────────────────── */
 class SppServerService : Service() {
-
-    /* ---------- 상수 ---------- */
     companion object {
-        private const val TAG            = "SppServer"
+        private const val TAG = "SppServer"
         private const val CHANNEL_STATUS = "spp_status"
-        private const val CHANNEL_MESSAGE= "spp_msg"
-        private const val NOTI_FGS       = 1
-        private const val NOTI_STATE     = 100
-        private var   notiSeq            = 2
+        private const val CHANNEL_MESSAGE = "spp_msg"
+        private const val NOTI_FGS = 1
+        private const val NOTI_STATE = 100
+        private var notiSeq = 2
+        const val EXTRA_ID = "id"
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private val MAGIC_TXT = byteArrayOf(0x54, 0x58, 0x54)   // "TXT"
+        private val MAGIC_IMG = byteArrayOf(0x49, 0x4D, 0x47)   // "IMG"
 
-        val  SPP_UUID     : UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-        private val MAGIC_TXT    = byteArrayOf(0x54, 0x58, 0x54)   // "TXT"
-        private val MAGIC_IMG    = byteArrayOf(0x49, 0x4D, 0x47)   // "IMG"
+        // ★ 읽음 동기화 관련
+        private const val VER_TXT_V4: Byte = 0x04
+        private const val OP_READ_FROM_PHONE: Byte = 0x01
+        private const val OP_READ_TO_PHONE: Byte = 0x02        // PC  ➜  Phone
+        private const val VER_TXT_V5: Byte = 0x05
 
         /* Activity 갱신용 브로드캐스트 필드 */
-        const val ACTION_MSG     = "com.example.myapplication.ACTION_SPP_MSG"
-        const val EXTRA_CAT      = "cat"
-        const val EXTRA_SUB      = "sub"
-        const val EXTRA_TITLE    = "title"
-        const val EXTRA_BODY     = "body"
+        const val ACTION_MSG = "com.example.myapplication.ACTION_SPP_MSG"
+        const val ACTION_SYNC = "com.example.myapplication.ACTION_SYNC"     // ★
+        const val EXTRA_CAT = "cat"
+        const val EXTRA_SUB = "sub"
+        const val EXTRA_TITLE = "title"
+        const val EXTRA_BODY = "body"
         const val EXTRA_ICON_MSG = "icon_msg"
         const val EXTRA_ICON_SUB = "icon_sub"
         const val EXTRA_ICON_CAT = "icon_cat"
     }
 
     /* ---------- DB ---------- */
-    private val dao by lazy { AppDatabase.Companion.getInstance(applicationContext).messageDao() }
+    private val dao by lazy { AppDatabase.getInstance(applicationContext).messageDao() }
 
     /* ---------- Binder ---------- */
     inner class LocalBinder : Binder() {
         val service: SppServerService get() = this@SppServerService
         suspend fun syncReadStatus() = service.syncReadStatus()
     }
+    @Volatile private var outStream: DataOutputStream? = null
+    private fun getOut(sock: BluetoothSocket): DataOutputStream {
+        return outStream ?: DataOutputStream(sock.outputStream).also { outStream = it }
+    }
     override fun onBind(intent: Intent?) = LocalBinder()
 
     /* ---------- Bluetooth 상태 ---------- */
-    @Volatile private var activeSocket: BluetoothSocket? = null
-    private var secureSocket:   BluetoothServerSocket? = null
+    /* ---------- Bluetooth 상태 & 코루틴 ---------- */
+    @Volatile
+    private var activeSocket: BluetoothSocket? = null
+    private var secureSocket: BluetoothServerSocket? = null
     private var insecureSocket: BluetoothServerSocket? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -96,9 +108,13 @@ class SppServerService : Service() {
         startForeground(NOTI_FGS, buildFgsNoti("SPP 서버 초기화…"))
         launchServer()
     }
+
     override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
+
+
     override fun onDestroy() {
         secureSocket?.close(); insecureSocket?.close()
+        try { outStream?.close() } catch (_: Exception) {}
         scope.cancel()
         super.onDestroy()
     }
@@ -109,11 +125,12 @@ class SppServerService : Service() {
         val adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-            != PackageManager.PERMISSION_GRANTED) { stopSelf(); return }
-
+            != PackageManager.PERMISSION_GRANTED) {
+            stopSelf(); return
+        }
         if (!adapter.isEnabled) { stopSelf(); return }
 
-        secureSocket   = adapter.listenUsingRfcommWithServiceRecord("SPP_SECURE", SPP_UUID)
+        secureSocket   = adapter.listenUsingRfcommWithServiceRecord("SPP_SECURE",   SPP_UUID)
         insecureSocket = adapter.listenUsingInsecureRfcommWithServiceRecord("SPP_INSECURE", SPP_UUID)
 
         listOfNotNull(secureSocket, insecureSocket).forEach { ss ->
@@ -127,46 +144,52 @@ class SppServerService : Service() {
     }
 
     /* ───────── 클라이언트 루프 ───────── */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun handleClient(sock: BluetoothSocket) = scope.launch {
         activeSocket = sock
         showStateNoti("🔵 SPP 연결", sock.remoteDevice.address)
 
+        launch { syncReadStatus() }          // 읽음‑동기화 초기 전송
+
+        val ins = DataInputStream(sock.inputStream)
         try {
-            sock.use { s ->
-                val ins = s.inputStream
-                while (true) {
-                    val magic = readExactOrNull(ins, 3) ?: break
-                    val ver   = ins.read()
-                    when {
-                        magic.contentEquals(MAGIC_IMG) -> when (ver) {
-                            3 -> handleImgV3(ins)
-                            2 -> handleImgV2(ins)
-                            else -> handleImgLegacy(ins, ver)
-                        }
-                        magic.contentEquals(MAGIC_TXT) -> handleTxt(ins, ver)
-                        else -> emitStatus("알 수 없는 헤더", true)
+            while (isActive && sock.isConnected) {
+                val hdr = ByteArray(3); ins.readFully(hdr)
+                val ver = ins.read(); if (ver < 0) break
+
+                when {
+                    hdr.contentEquals(MAGIC_IMG) -> when (ver) {
+                        5 -> handleImgV5(ins)
+                        3 -> handleImgV3(ins)
+                        2 -> handleImgV2(ins)
+                        else -> handleImgLegacy(ins, ver)
                     }
+                    hdr.contentEquals(MAGIC_TXT) -> handleTxt(ins, ver)
+                    else -> emitStatus("알 수 없는 헤더", true)
                 }
             }
-        } catch (e: Exception) {
-            emitStatus("클라이언트 예외: ${e.message}", true)
+        } catch (e: IOException) {
+            emitStatus("I/O 예외: ${e.message}", true)
         } finally {
-            activeSocket = null
+            try { sock.close() } catch (_: IOException) {}
+            outStream = null                         // ★ 스트림 정리
+            if (activeSocket === sock) activeSocket = null
             showStateNoti("⚪ SPP 해제", sock.remoteDevice.address)
         }
     }
 
+
     /* ─────────── IMG v3 ─────────── */
-    private fun handleImgV3(ins: InputStream) {
+    private suspend fun handleImgV3(ins: InputStream) {
         val dis = DataInputStream(ins)
         val imgCat = readExact(ins, dis.readInt())
         val imgSub = readExact(ins, dis.readInt())
         val imgMsg = readExact(ins, dis.readInt())
 
-        val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val cat = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val sub = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
         val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val body = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
         val pCat = saveIfAbsent(cat, imgCat)
         val pSub = saveIfAbsent("${cat}_${sub}", imgSub)
@@ -179,13 +202,13 @@ class SppServerService : Service() {
     }
 
     /* ─────────── IMG v2 ─────────── */
-    private fun handleImgV2(ins: InputStream) {
-        val dis     = DataInputStream(ins)
+    private suspend fun handleImgV2(ins: InputStream) {
+        val dis = DataInputStream(ins)
         val imgData = readExact(ins, dis.readInt())
-        val cat     = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val sub     = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val title   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val body    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val cat = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val sub = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val body = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
         val pSub = saveIfAbsent("${cat}_${sub}", imgData)
 
@@ -193,54 +216,157 @@ class SppServerService : Service() {
     }
 
     /* ─────────── IMG legacy ─────────── */
-    private fun handleImgLegacy(ins: InputStream, ver: Int) {
-        val dis     = DataInputStream(ins)
+    private suspend fun handleImgLegacy(ins: InputStream, ver: Int) {
+        val dis = DataInputStream(ins)
         val imgData = readExact(ins, dis.readInt())
-        val title   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val body    = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val body = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
 
         processImagePacket(imgData, "misc", "", title, body, fallbackIcon = "")
     }
-
     /* ───────── 공통 이미지 처리 ───────── */
-    private fun processImagePacket(
+    private suspend fun processImagePacket(
         imgData: ByteArray,
         cat: String,
         sub: String,
         title: String,
         body: String,
-        fallbackIcon: String
+        fallbackIcon: String            // best 아이콘을 iconCat 로 전달
     ) {
-        val bmp = decodeImage(imgData)
+        val bmp   = decodeImage(imgData)
+        val newId = UUID.randomUUID().toString()      // 고유 ID
 
         if (bmp == null) {
             emitStatus("Bitmap decode 실패 → 텍스트 알림으로 대체")
             showTextNoti("[$cat/$sub] $title", body)
-            persistMessage(cat, sub, title, body, fallbackIcon)
-            broadcastMsg(cat, sub, title, body, fallbackIcon, null, null)
+            persistMessage(newId, cat, sub, title, body, fallbackIcon)
+            broadcastMsg(
+                newId, cat, sub, title, body,
+                null,            // iconMsg
+                null,            // iconSub
+                fallbackIcon     // iconCat
+            )
             return
         }
 
         showImageTextNoti(bmp, "[$cat/$sub] $title", body)
-        persistMessage(cat, sub, title, body, fallbackIcon)
-        broadcastMsg(cat, sub, title, body, fallbackIcon, null, null)
+        persistMessage(newId, cat, sub, title, body, fallbackIcon)
+        broadcastMsg(
+            newId, cat, sub, title, body,
+            null, null, fallbackIcon
+        )
     }
 
+
     /* ─────────── TXT ─────────── */
-    private fun handleTxt(ins: InputStream, ver: Int) {
-        val dis  = DataInputStream(ins)
-        val cat  = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else "text"
-        val sub  = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else ""
-        val title= String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
-        val body = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private suspend fun handleTxt(ins: InputStream, ver: Int) {
+        val dis = DataInputStream(ins)
+
+        // ① READ‑SYNC (v4)
+        if (ver == VER_TXT_V4.toInt()) {
+            val op = dis.readByte()
+            if (op == OP_READ_TO_PHONE) { handleReadSyncFromPc(dis); return }
+            if (op == OP_READ_FROM_PHONE) {
+                val cnt = dis.readUnsignedShort()
+                repeat(cnt) {
+                    ins.skipNBytes(dis.readUnsignedShort().toLong())
+                }
+                Log.i(TAG, "READ‑sync echo 무시 ($cnt)")
+                return
+            }
+        }
+
+        // ② TXT‑v5 : 고유 id 포함
+        if (ver == VER_TXT_V5.toInt()) {
+            val idLen = dis.readUnsignedShort()
+            val id    = String(readExact(ins, idLen), StandardCharsets.UTF_8)
+
+            val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+            val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+            val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+            val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+
+            showTextNoti("[$cat/$sub] $title", body)
+            scope.launch { persistMessage(id, cat, sub, title, body, "") }
+            broadcastMsg(id, cat, sub, title, body, null, null, null)
+            return
+        }
+
+        // ③ legacy TXT (v1 ~ v3)
+        val cat   = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else "text"
+        val sub   = if (ver >= 2) String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8) else ""
+        val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+
+        val newId = UUID.randomUUID().toString()
 
         showTextNoti("[$cat/$sub] $title", body)
-        persistMessage(cat, sub, title, body, iconPath = "")
-        broadcastMsg(cat, sub, title, body, null, null, null)
+        persistMessage(newId, cat, sub, title, body, "")
+        broadcastMsg(newId, cat, sub, title, body, null, null, null)
+    }
+
+    /* ─────────── IMG v5 ─────────── */
+    private fun handleImgV5(ins: InputStream) {
+        val dis   = DataInputStream(ins)
+
+        val idLen = dis.readUnsignedShort()
+        val id    = String(readExact(ins, idLen), StandardCharsets.UTF_8)
+
+        val imgCat = readExact(ins, dis.readInt())
+        val imgSub = readExact(ins, dis.readInt())
+        val imgMsg = readExact(ins, dis.readInt())
+
+        val cat   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val sub   = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val title = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+        val body  = String(readExact(ins, dis.readInt()), StandardCharsets.UTF_8)
+
+        // 아이콘 저장 & 우선순위 선정
+        val pCat = saveIfAbsent(cat, imgCat)
+        val pSub = saveIfAbsent("${cat}_${sub}", imgSub)
+        val pMsg = saveIfAbsent("${cat}_${sub}_m", imgMsg)
+        val best = pMsg ?: pSub ?: pCat ?: ""
+
+        val bmp = when {
+            imgMsg.isNotEmpty() -> decodeImage(imgMsg)
+            imgSub.isNotEmpty() -> decodeImage(imgSub)
+            else                -> decodeImage(imgCat)
+        }
+
+        if (bmp == null) showTextNoti("[$cat/$sub] $title", body)
+        else             showImageTextNoti(bmp, "[$cat/$sub] $title", body)
+
+        scope.launch { persistMessage(id, cat, sub, title, body, best) }
+        broadcastMsg(id, cat, sub, title, body,
+            null, null, best)
+    }
+
+
+
+    private fun handleReadSyncFromPc(dis: DataInputStream) {
+        val cnt = dis.readUnsignedShort()
+        val ids = mutableListOf<String>()
+        repeat(cnt) {
+            val len = dis.readUnsignedShort()
+            ids += String(readExact(dis, len), StandardCharsets.UTF_8)
+        }
+        Log.i(TAG, "READ‑sync ← PC : ${ids.size}건")
+
+        // DB 업데이트
+        scope.launch {
+            dao.markReadList(ids)               // ★ DAO 에 새로 추가된 메서드
+        }
+
+        // UI 갱신용 broadcast (선택)
+        LocalBroadcastManager.getInstance(this).sendBroadcast(
+            Intent(ACTION_SYNC).putStringArrayListExtra("ids", ArrayList(ids))
+        )
     }
 
     /* ───────── 이미지 디코더 ───────── */
     private fun decodeImage(src: ByteArray): Bitmap? {
+        if (src.isEmpty()) return null
         var data = src
 
         /* ① Base64 판단 & 복호화 */
@@ -305,15 +431,18 @@ class SppServerService : Service() {
             Bitmap.createScaledBitmap(bmpOrig, 128, 128, true) else bmpOrig
 
         val catSub = title.substringBefore(']').trim('[', ' ')
-        val time   = DateFormat.format("HH:mm", System.currentTimeMillis())
+        val time = DateFormat.format("HH:mm", System.currentTimeMillis())
 
         val rv = RemoteViews(packageName, com.example.myapplication.R.layout.notif_popup).apply {
-            setImageViewBitmap(com.example.myapplication.R.id.ivThumb , bmp)
-            setTextViewText (com.example.myapplication.R.id.tvCatSub , catSub)
-            setTextViewText (com.example.myapplication.R.id.tvTime   , time)
-            setTextViewText (com.example.myapplication.R.id.tvTitle  , title.substringAfter("] ").trim())
-            setTextViewText (com.example.myapplication.R.id.tvDetail , "")
-            setTextViewText (com.example.myapplication.R.id.tvBody   , body)
+            setImageViewBitmap(com.example.myapplication.R.id.ivThumb, bmp)
+            setTextViewText(com.example.myapplication.R.id.tvCatSub, catSub)
+            setTextViewText(com.example.myapplication.R.id.tvTime, time)
+            setTextViewText(
+                com.example.myapplication.R.id.tvTitle,
+                title.substringAfter("] ").trim()
+            )
+            setTextViewText(com.example.myapplication.R.id.tvDetail, "")
+            setTextViewText(com.example.myapplication.R.id.tvBody, body)
         }
 
         val noti = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
@@ -341,39 +470,63 @@ class SppServerService : Service() {
         )
 
     /* ───────── DB 저장 ───────── */
-    private fun persistMessage(
-        cat: String, sub: String, title: String, body: String, iconPath: String
-    ) = scope.launch {
-        dao.upsert(
-            MessageEntity(
-                id = UUID.randomUUID().toString(),
-                catId = cat,
-                subId = if (sub.isBlank()) "" else "${cat}_${sub}",
-                title = title, body = body,
-                ts = System.currentTimeMillis(),
-                iconPath = iconPath,
-                read = false, synced = false
-            )
+    private suspend fun persistMessage(
+        id: String,
+        cat: String, sub: String,
+        title: String, body: String,
+        iconPath: String
+    ) = dao.upsert(
+        MessageEntity(
+            id = id,                          // ★ 그대로 사용
+            catId = cat,
+            subId = if (sub.isBlank()) "" else "${cat}_${sub}",
+            title = title,
+            body = body,
+            ts = System.currentTimeMillis(),
+            iconPath = iconPath,
+            read = false,
+            synced = false
         )
-    }
+    )
 
-    /* ───────── 읽음 동기화 ───────── */
+    /*  읽음 동기화  */
+    /*  읽음 동기화  */
     suspend fun syncReadStatus() {
-        val os = activeSocket?.outputStream ?: return
-        val pending = dao.pendingReadSync(); if (pending.isEmpty()) return
+        val pending = dao.pendingReadSync()
+        if (pending.isEmpty()) return
 
-        val baos = ByteArrayOutputStream()
-        DataOutputStream(baos).use { dos ->
-            dos.write(MAGIC_TXT); dos.writeByte(4); dos.writeByte(0x01)
-            dos.writeShort(pending.size)
-            pending.forEach {
-                val id = it.id.toByteArray(StandardCharsets.UTF_8)
-                dos.writeShort(id.size); dos.write(id)
+        var waited = 0
+        while (waited < 5000) {               // 최대 5 초 대기
+            val s = activeSocket
+            if (s != null && s.isConnected) {
+                sendReadSync(s, pending)
+                return
             }
+            delay(250)
+            waited += 250
         }
-        os.write(baos.toByteArray()); os.flush()
-        dao.confirmSynced(pending.map { it.id })
+        Log.w(TAG, "syncReadStatus: socket null – postpone (${pending.size})")
     }
+
+    private suspend fun sendReadSync(sock: BluetoothSocket,
+                                     list: List<MessageEntity>) {
+        val dos = getOut(sock)                // ★ 닫지 않고 재사용
+        synchronized(dos) {
+            dos.write(MAGIC_TXT)
+            dos.writeByte(VER_TXT_V4.toInt())
+            dos.writeByte(OP_READ_FROM_PHONE.toInt())
+            dos.writeShort(list.size)
+            list.forEach {
+                val b = it.id.toByteArray(StandardCharsets.UTF_8)
+                dos.writeShort(b.size); dos.write(b)
+            }
+            dos.flush()
+        }
+        dao.confirmSynced(list.map { it.id })
+        Log.i(TAG, "READ‑sync ▶ PC (${list.size})")
+    }
+
+
 
     /* ───────── 헬퍼 ───────── */
     private fun readExact(ins: InputStream, size: Int) = ByteArray(size).also { buf ->
@@ -383,22 +536,26 @@ class SppServerService : Service() {
             if (n < 0) throw EOFException(); off += n
         }
     }
+
     private fun readExactOrNull(ins: InputStream, size: Int): ByteArray? =
         runCatching { readExact(ins, size) }.getOrNull()
 
     private fun saveIfAbsent(key: String, data: ByteArray): String? {
         if (data.isEmpty()) return null
         val file = File(filesDir, "icons/${key.lowercase(Locale.ROOT)}.png")
-        if (!file.exists()) { file.parentFile?.mkdirs(); file.writeBytes(data) }
+        if (!file.exists()) {
+            file.parentFile?.mkdirs(); file.writeBytes(data)
+        }
         return file.absolutePath
     }
 
     /* ---------- 브로드캐스트 ---------- */
     private fun broadcastMsg(
-        cat: String, sub: String, title: String, body: String,
+        id: String, cat: String, sub: String, title: String, body: String,
         iconMsg: String?, iconSub: String?, iconCat: String?
     ) {
-        val i = Intent(ACTION_MSG).apply {
+        Intent(ACTION_MSG).apply {
+            putExtra(EXTRA_ID, id)
             putExtra(EXTRA_CAT, cat)
             putExtra(EXTRA_SUB, sub)
             putExtra(EXTRA_TITLE, title)
@@ -406,9 +563,11 @@ class SppServerService : Service() {
             putExtra(EXTRA_ICON_MSG, iconMsg ?: "")
             putExtra(EXTRA_ICON_SUB, iconSub ?: "")
             putExtra(EXTRA_ICON_CAT, iconCat ?: "")
+        }.also {
+            LocalBroadcastManager.getInstance(this).sendBroadcast(it)
         }
-        LocalBroadcastManager.getInstance(this).sendBroadcast(i)
     }
+
 
     /* ---------- 채널 & 상태 ---------- */
     private fun buildFgsNoti(text: String) =
@@ -432,6 +591,7 @@ class SppServerService : Service() {
             ).apply { enableVibration(true) }
         )
     }
+
     private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
 
     private fun emitStatus(text: String, err: Boolean = false) {

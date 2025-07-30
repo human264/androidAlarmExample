@@ -27,5 +27,6 @@ data class UiMessage(
     val body: String,
     val ts: Long,
     var iconPath: String? = null,
-    var read: Boolean = false        // 👈 읽음 여부(클릭 시 true 로 변경)
+    var read: Boolean = false,        // 👈 읽음 여부(클릭 시 true 로 변경)
+    var synced: Boolean = false        // 👈 읽음 여부(클릭 시 true 로 변경)
 )

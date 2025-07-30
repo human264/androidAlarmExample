@@ -6,7 +6,7 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 
-@Database(entities = [MessageEntity::class], version = 1, exportSchema = false)
+@Database(entities = [MessageEntity::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
 
     /* DAO 노출 */
